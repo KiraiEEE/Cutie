@@ -1,0 +1,17 @@
+/target
+
+*.mp4
+*.m4a
+*.webm
+*.mkv
+*.mp3
+*.mov
+*.part
+*.ytdl
+*.aria2
+
+/smoke*
+out.txt
+err.txt
+*.log
+shot*.png
