@@ -15,3 +15,4 @@ out.txt
 err.txt
 *.log
 shot*.png
+/dist

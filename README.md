@@ -27,7 +27,17 @@ folder. Also works as a plain CLI.
 | [ffmpeg](https://ffmpeg.org) | for merging/extracting (usually ships with yt-dlp installs) |
 | `node` (optional) | yt-dlp uses it for JS-challenge sites |
 
-## Install the context menu
+## Install
+
+**Setup (recommended):** run `cutie-<version>-setup.exe`. It needs no admin rights, and it:
+
+- installs cutie into `%LOCALAPPDATA%\cutie`
+- adds **Download with Cutie** to the Explorer context menu, plus a Start-Menu shortcut
+- installs whatever is missing of yt-dlp, ffmpeg and Deno (yt-dlp's JavaScript runtime
+  for YouTube) through winget — or downloads `yt-dlp.exe` directly when winget is missing
+- shows up in *Settings → Apps*, where uninstalling removes all of it
+
+**Portable:** unzip `cutie-<version>-portable.zip` and register the menu yourself:
 
 ```
 cutie.exe --install
@@ -92,6 +102,13 @@ Exit codes: `0` success · `1` the download failed · `2` bad usage · `130` int
 ```
 cargo build --release
 cargo test
+```
+
+Release artifacts (setup + portable zip, into `dist\`) need
+[Inno Setup 6](https://jrsoftware.org/isinfo.php):
+
+```
+powershell -File installeruild.ps1
 ```
 
 Rust 1.80+, targets Windows only (`windows-sys` for the native bits). The app icon is
