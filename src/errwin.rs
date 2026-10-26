@@ -15,7 +15,7 @@ use crate::theme::{
 const W: f32 = 380.0;
 const H: f32 = 80.0;
 /// Dismiss on its own after this long.
-const AUTO_CLOSE: f32 = 2.4;
+const AUTO_CLOSE: f32 = 3.5;
 
 pub struct ErrApp {
     msg: String,
@@ -43,18 +43,17 @@ impl eframe::App for ErrApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let elapsed = self.born.elapsed().as_secs_f32();
 
-        let (mut alpha, mut scale, mut slide) = pop_in(elapsed / POP_DUR);
+        let mut alpha = pop_in(elapsed / POP_DUR);
         if let Some(ca) = self.closing_at {
             let q = ca.elapsed().as_secs_f32() / OUT_DUR;
             if q >= 1.0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
-            let (a, s, d) = pop_out(q);
-            alpha *= a;
-            scale *= s;
-            slide += d;
-        } else if elapsed > AUTO_CLOSE || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            alpha *= pop_out(q);
+        } else if elapsed > AUTO_CLOSE
+            || ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.pointer.any_click())
+        {
             self.closing_at = Some(Instant::now());
         }
 
@@ -64,12 +63,11 @@ impl eframe::App for ErrApp {
         egui::CentralPanel::default()
             .frame(Frame::NONE)
             .show(ctx, |ui| {
-                let size = Vec2::new(W, H) * scale;
                 let rect = Rect::from_center_size(
-                    ui.available_rect_before_wrap().center() + Vec2::new(0.0, slide),
-                    size,
+                    ui.available_rect_before_wrap().center(),
+                    Vec2::new(W, H),
                 );
-                ui.allocate_rect(rect, egui::Sense::hover());
+                ui.allocate_rect(rect, egui::Sense::click());
 
                 let p = ui.painter();
                 p.rect_filled(rect, zero, alpha_c(bg(), a8));
@@ -115,6 +113,7 @@ impl eframe::App for ErrApp {
                     );
                 }
             });
+        self.pipe.flush();
 
         let animating = self.closing_at.is_some() || elapsed < POP_DUR;
         ctx.request_repaint_after(std::time::Duration::from_millis(if animating {

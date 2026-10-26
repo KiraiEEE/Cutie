@@ -16,8 +16,9 @@
 //!   mixed Latin/Arabic text across two baselines.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
 use ab_glyph::{point, Font as AbFont, FontRef, Glyph as AbGlyph, GlyphId, PxScale};
@@ -32,6 +33,8 @@ const ATLAS_W: usize = 1024;
 const ATLAS_H: usize = 1024;
 /// Shaped-layout cache cap; beyond this the map is dropped wholesale.
 const MAX_LAYOUT_CACHE: usize = 512;
+/// Layouts kept per (size, weight) bucket; the oldest one is dropped first.
+const BUCKET_CAP: usize = 48;
 
 const F_LATIN: u8 = 0;
 const F_LATIN_BOLD: u8 = 1;
@@ -40,7 +43,8 @@ const F_ARABIC_BOLD: u8 = 3;
 
 /// Does this string need the shaping pipeline (any RTL/complex char)?
 pub fn needs(s: &str) -> bool {
-    s.chars().any(is_complex_char)
+    // Cheap SIMD-friendly rejection for the overwhelmingly common ASCII case.
+    !s.is_ascii() && s.chars().any(is_complex_char)
 }
 
 fn is_complex_char(c: char) -> bool {
@@ -96,7 +100,7 @@ impl TextStyle {
 /// every face (and every pipeline instance) shares the same allocation.
 type FontCache = HashMap<&'static str, Option<&'static [u8]>>;
 
-fn font_bytes(name: &'static str) -> Option<&'static [u8]> {
+pub fn font_bytes(name: &'static str) -> Option<&'static [u8]> {
     static CACHE: LazyLock<Mutex<FontCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(hit) = cache.get(name) {
@@ -232,6 +236,11 @@ struct Atlas {
     image: ColorImage,
     rasters: HashMap<RasterKey, Raster>,
     dirty: bool,
+    /// The whole atlas must be re-uploaded (after a reset).
+    full: bool,
+    /// Smallest box covering every pixel written since the last upload:
+    /// (min_x, min_y, max_x, max_y) — max exclusive.
+    rect: Option<[u32; 4]>,
 }
 
 impl Atlas {
@@ -243,6 +252,8 @@ impl Atlas {
             image: ColorImage::new([ATLAS_W, ATLAS_H], Color32::TRANSPARENT),
             rasters: HashMap::new(),
             dirty: false,
+            full: false,
+            rect: None,
         }
     }
 
@@ -253,6 +264,19 @@ impl Atlas {
         self.rasters.clear();
         self.image.pixels.fill(Color32::TRANSPARENT);
         self.dirty = true;
+        self.full = true;
+        self.rect = None;
+    }
+
+    /// Grow the dirty box to cover a write of a `w x h` block at `(ax, ay)`.
+    fn mark(&mut self, ax: u32, ay: u32, w: u32, h: u32) {
+        let x1 = (ax + w).min(ATLAS_W as u32);
+        let y1 = (ay + h).min(ATLAS_H as u32);
+        self.dirty = true;
+        self.rect = Some(match self.rect {
+            None => [ax, ay, x1, y1],
+            Some([x0, y0, cx0, cy0]) => [x0.min(ax), y0.min(ay), cx0.max(x1), cy0.max(y1)],
+        });
     }
 
     fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
@@ -325,7 +349,7 @@ impl Atlas {
                                     }
                                 }
                             });
-                            self.dirty = true;
+                            self.mark(ax, ay, bw, bh);
                             Raster {
                                 ox: bounds.min.x,
                                 oy: bounds.min.y,
@@ -372,13 +396,48 @@ impl Atlas {
 // Pipeline
 // ---------------------------------------------------------------------------
 
+/// One bucket of shaped layouts: the same text at the same size and weight.
+#[derive(Default)]
+struct LayoutBucket {
+    map: HashMap<String, Rc<Layout>>,
+    /// Insertion order, so the oldest layout can be dropped first.
+    order: VecDeque<String>,
+}
+
+impl LayoutBucket {
+    fn get(&self, text: &str) -> Option<Rc<Layout>> {
+        self.map.get(text).cloned()
+    }
+
+    fn insert(&mut self, text: &str, layout: Rc<Layout>) {
+        if self.map.insert(text.to_string(), layout).is_none() {
+            self.order.push_back(text.to_string());
+        }
+        while self.order.len() > BUCKET_CAP {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Shaped-layout cache: (size, weight) → text → layout.
+type LayoutCache = HashMap<(u32, bool), LayoutBucket>;
+
 pub struct TextPipeline {
     faces: [Option<Face>; 4],
     atlas: Atlas,
     tex: Option<TextureHandle>,
     /// `RefCell` so `measure`/`fit` (shared refs) can warm the cache too;
     /// the pipeline is only ever touched from the UI thread.
-    layouts: RefCell<HashMap<(String, u32, bool), Layout>>,
+    ///
+    /// Bucketed by (size, weight) so lookups by `&str` never allocate a key.
+    /// `Rc` keeps per-frame hits to a refcount bump instead of cloning glyphs.
+    layouts: RefCell<LayoutCache>,
 }
 
 impl Default for TextPipeline {
@@ -418,6 +477,11 @@ impl TextPipeline {
     /// Width in px, no rasterization (for fit/measure).
     pub fn measure(&self, text: &str, style: TextStyle) -> f32 {
         self.layout_for(text, style).width
+    }
+
+    /// Apply pending atlas updates once per frame (after all painting).
+    pub fn flush(&mut self) {
+        self.upload();
     }
 
     /// Truncate to max_w; returns (display_string, was_truncated).
@@ -501,7 +565,8 @@ impl TextPipeline {
         if !mesh.indices.is_empty() {
             painter.add(Shape::Mesh(mesh.into()));
         }
-        self.upload();
+        // Atlas upload is deferred to `flush()` so one frame costs at most one
+        // 1024² texture upload instead of one per text run.
     }
 
     fn ensure_rasters(&mut self, layout: &Layout, size: f32) {
@@ -518,22 +583,44 @@ impl TextPipeline {
             return;
         }
         if let Some(tex) = self.tex.as_mut() {
-            tex.set(self.atlas.image.clone(), TextureOptions::LINEAR);
+            match (self.atlas.full, self.atlas.rect) {
+                // A glyph atlas reset wipes everything — send it all.
+                (true, _) | (_, None) => {
+                    tex.set(self.atlas.image.clone(), TextureOptions::LINEAR);
+                }
+                // Otherwise only the box that actually changed: new glyphs
+                // land in a few hundred pixels, not the whole 1024² image.
+                (false, Some([x0, y0, x1, y1])) => {
+                    let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+                    let mut sub = ColorImage::new([w, h], Color32::TRANSPARENT);
+                    for row in 0..h {
+                        let src = (y0 as usize + row) * ATLAS_W + x0 as usize;
+                        sub.pixels[row * w..row * w + w]
+                            .copy_from_slice(&self.atlas.image.pixels[src..src + w]);
+                    }
+                    tex.set_partial([x0 as usize, y0 as usize], sub, TextureOptions::LINEAR);
+                }
+            }
         }
         self.atlas.dirty = false;
+        self.atlas.full = false;
+        self.atlas.rect = None;
     }
 
-    fn layout_for(&self, text: &str, style: TextStyle) -> Layout {
-        let key = (text.to_string(), style.size.to_bits(), style.bold);
-        let mut layouts = self.layouts.borrow_mut();
-        if let Some(hit) = layouts.get(&key) {
-            return hit.clone();
+    fn layout_for(&self, text: &str, style: TextStyle) -> Rc<Layout> {
+        let key = (style.size.to_bits(), style.bold);
+        let mut cache = self.layouts.borrow_mut();
+        let bucket = cache.entry(key).or_default();
+        if let Some(hit) = bucket.get(text) {
+            return hit;
         }
-        if layouts.len() > MAX_LAYOUT_CACHE {
-            layouts.clear();
+        let layout = Rc::new(Self::layout(text, style.size, style.bold, &self.faces));
+        bucket.insert(text, layout.clone());
+        // The whole cache is only dropped when it really grew out of hand —
+        // buckets evict their own oldest entries long before that.
+        if cache.values().map(LayoutBucket::len).sum::<usize>() > MAX_LAYOUT_CACHE {
+            cache.clear();
         }
-        let layout = Self::layout(text, style.size, style.bold, &self.faces);
-        layouts.insert(key, layout.clone());
         layout
     }
 
@@ -672,15 +759,6 @@ pub fn fit_egui(
     (format!("{head}…"), true)
 }
 
-/// Character-count truncation with an ellipsis.
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{head}…")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,13 +830,6 @@ mod tests {
         p.ensure_rasters(&again, 14.0);
         assert_eq!(p.debug_raster_count(), first, "glyphs must be reused");
         assert!(first > 0, "expected some rasters");
-    }
-
-    #[test]
-    fn truncate_helpers() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 6), "hello…");
-        assert_eq!(truncate("مرحبا بالعالم", 5), "مرحب…");
     }
 
     #[test]

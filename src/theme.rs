@@ -62,34 +62,19 @@ pub fn to_clear_color(c: Color32) -> [f32; 4] {
 
 // ---------------- animation ----------------
 
-pub fn ease_out_cubic(x: f32) -> f32 {
-    1.0 - (1.0 - x).powi(3)
-}
+// The window itself is opaque, so the card only fades: scaling or sliding it
+// inside a fixed window just shows its border creeping around.
 
-pub fn ease_in_quad(x: f32) -> f32 {
-    x * x
-}
-
-fn ease_out_back(x: f32) -> f32 {
-    const C1: f32 = 1.2;
-    const C3: f32 = C1 + 1.0;
-    1.0 + C3 * (x - 1.0).powi(3) + C1 * (x - 1.0).powi(2)
-}
-
-/// pop-in: (alpha, scale, slide_px)
-pub fn pop_in(p: f32) -> (f32, f32, f32) {
+/// Fade-in alpha for progress `p` in 0..=1.
+pub fn pop_in(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
-    let alpha = 1.0 - (1.0 - p).powi(2);
-    let scale = 0.94 + 0.06 * ease_out_back(p);
-    let slide = 14.0 * (1.0 - ease_out_cubic(p));
-    (alpha, scale, slide)
+    1.0 - (1.0 - p).powi(2)
 }
 
-/// fade-out: (alpha, scale, slide_px)
-pub fn pop_out(q: f32) -> (f32, f32, f32) {
+/// Fade-out alpha for progress `q` in 0..=1.
+pub fn pop_out(q: f32) -> f32 {
     let q = q.clamp(0.0, 1.0);
-    let e = ease_in_quad(q);
-    (1.0 - e, 1.0 - 0.05 * e, 8.0 * e)
+    1.0 - q * q
 }
 
 /// Alpha channel of an f32 alpha in 0..=1, as u8.
@@ -129,11 +114,6 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
-/// Dim a u8 alpha (used to soften already-faded text).
-pub fn dim_alpha(a8: u8) -> u8 {
-    ((u16::from(a8) * 3) / 5) as u8
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,18 +128,8 @@ mod tests {
 
     #[test]
     fn pop_in_out_are_monotone_enough() {
-        let (a0, s0, d0) = pop_in(0.0);
-        let (a1, s1, _) = pop_in(1.0);
-        assert!(a0 < a1);
-        assert!(s0 < s1);
-        assert!(d0 > 0.0);
-        let (oa, _, od) = pop_out(1.0);
-        assert!(oa <= 0.0 && od >= 8.0);
-    }
-
-    #[test]
-    fn dim_alpha_shrinks() {
-        assert!(dim_alpha(200) < 200);
-        assert_eq!(dim_alpha(0), 0);
+        assert!(pop_in(0.0) < pop_in(0.5) && pop_in(0.5) < pop_in(1.0));
+        assert_eq!(pop_in(1.0), 1.0);
+        assert!(pop_out(0.0) > pop_out(0.5) && pop_out(1.0) <= 0.0);
     }
 }

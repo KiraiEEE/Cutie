@@ -63,25 +63,27 @@ pub fn install() -> Result<PathBuf, String> {
                 .unwrap_or("unknown")
         ));
     }
+    // The script only prints OK when every registry write went through.
+    if !String::from_utf8_lossy(&out.stdout).contains("OK") {
+        return Err("registry install did not finish".into());
+    }
     Ok(dest)
 }
 
-pub fn uninstall() {
+pub fn uninstall() -> Result<(), String> {
     let script = format!(
         "$ErrorActionPreference = 'SilentlyContinue'\n\
          $keys = @({keys});\n\
          foreach ($k in $keys) {{ Remove-Item -Path $k -Recurse -Force }}\n\
          $sm = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\cutie';\n\
-         if (Test-Path $sm) {{ Remove-Item -Path $sm -Recurse -Force }}\n\
-         $app = Join-Path $env:LOCALAPPDATA 'cutie';\n\
-         if (Test-Path $app) {{ Remove-Item -Path $app -Recurse -Force }}\n",
+         if (Test-Path $sm) {{ Remove-Item -Path $sm -Recurse -Force }}\n",
         keys = TARGETS
             .iter()
             .map(|(k, _)| format!("'{k}'"))
             .collect::<Vec<_>>()
             .join(",")
     );
-    let _ = Command::new("powershell")
+    let out = Command::new("powershell")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -89,9 +91,53 @@ pub fn uninstall() {
             "-Command",
             &script,
         ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("powershell: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+
+    // The app directory contains the running exe, so it can only be deleted
+    // after this process exits. A detached hidden PowerShell does that.
+    schedule_self_cleanup(&app_dir());
+    Ok(())
+}
+
+fn schedule_self_cleanup(dir: &std::path::Path) {
+    let script = cleanup_script(dir, std::process::id());
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &script,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.spawn();
+}
+
+fn cleanup_script(dir: &std::path::Path, pid: u32) -> String {
+    let dir = dir.to_string_lossy().replace('\'', "''");
+    format!(
+        "$ErrorActionPreference = 'SilentlyContinue'\n\
+         for ($i = 0; $i -lt 150; $i++) {{\n\
+           if (-not (Get-Process -Id {pid} -ErrorAction SilentlyContinue)) {{ break }}\n\
+           Start-Sleep -Milliseconds 100\n\
+         }}\n\
+         Remove-Item -LiteralPath '{dir}' -Recurse -Force\n"
+    )
 }
 
 /// The PowerShell that registers the menu entries + start-menu shortcut.
@@ -128,7 +174,8 @@ fn install_script(exe: &str, ico: &str) -> String {
          $w = New-Object -ComObject WScript.Shell\n\
          $l = $w.CreateShortcut((Join-Path $sm 'cutie.lnk'))\n\
          $l.TargetPath = $exe\n\
-         $l.WorkingDirectory = $exe\n\
+         $l.WorkingDirectory = Split-Path -Parent $exe\n\
+         $l.IconLocation = $ico\n\
          $l.Description = 'cutie video downloader'\n\
          $l.Save()\n\
          Write-Output 'OK'\n"
@@ -172,6 +219,14 @@ mod tests {
     #[test]
     fn icon_bytes_are_a_real_ico() {
         assert_eq!(&ICON_BYTES[..4], &[0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn cleanup_script_waits_for_pid_and_escapes_path() {
+        let s = cleanup_script(std::path::Path::new("C:\\Users\\o'brien\\cutie"), 4242);
+        assert!(s.contains("o''brien"));
+        assert!(s.contains("Get-Process -Id 4242"));
+        assert!(s.contains("Remove-Item -LiteralPath"));
     }
 
     #[test]
